@@ -1,0 +1,15 @@
+data:
+  image_size: 256
+
+model:
+  clip_model: ViT-B/32
+  feature_dim: 512
+  sketch_backbone: resnet50
+  sketch_pretrained: model/resnet50_quickdraw_2000samples_20251112_012505.pth
+  num_template_prompts: 13
+  fusion_heads: 8
+  fusion_layers: 3
+  decouple_dim: 256
+
+retrieval:
+  gamma: 0.64
