@@ -4,3 +4,9 @@ datasets/
 __pycache__/
 *.pyc
 .stfusion_cache/
+
+checkpoints/
+
+model/
+
+datasets.zip
