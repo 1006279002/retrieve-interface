@@ -1,3 +1,24 @@
+"""
+STFusionIR GUI 模块
+===================
+基于 PyQt5 的桌面检索界面。
+
+布局概览:
+  ┌────────────┬──────────────────────────────────────────┐
+  │  左侧面板   │               右侧面板                    │
+  │            │  ┌─────────┬─────────┬────────────────┐  │
+  │  Dataset   │  │ Selected│Reference│  Query Setup   │  │
+  │  Selector  │  │ Sketch  │  Image  │  (Text Editor) │  │
+  │            │  └─────────┴─────────┴────────────────┘  │
+  │  Query     │  ┌─────────────────────────────────────┐ │
+  │  Browser   │  │     Sketch Candidates (横向滚动)     │ │
+  │  (列表)    │  └─────────────────────────────────────┘ │
+  │            │  ┌──────┬──────┬──────┬──────┬──────┐   │
+  │            │  │Top-1 │Top-2 │Top-3 │Top-4 │Top-5 │   │
+  │            │  └──────┴──────┴──────┴──────┴──────┘   │
+  └────────────┴──────────────────────────────────────────┘
+"""
+
 from __future__ import annotations
 
 import random
@@ -31,10 +52,15 @@ from PyQt5.QtWidgets import (
 from .backend import FusionDatasetSession, FusionWorkspace, QuerySample, RetrievalResult
 
 
+# ============================================================
+# 后台线程 — 将耗时操作移出主线程，保持 GUI 响应
+# ============================================================
+
 class DatasetLoaderThread(QThread):
-    loaded = pyqtSignal(object)
-    failed = pyqtSignal(str)
-    status = pyqtSignal(str)
+    """后台线程：加载数据集（模型 + 图库特征矩阵）。"""
+    loaded = pyqtSignal(object)     # 成功：发射 FusionDatasetSession
+    failed = pyqtSignal(str)        # 失败：发射错误堆栈
+    status = pyqtSignal(str)        # 进度更新
 
     def __init__(self, workspace: FusionWorkspace, dataset_key: str) -> None:
         super().__init__()
@@ -57,9 +83,10 @@ class DatasetLoaderThread(QThread):
 
 
 class RetrievalThread(QThread):
-    completed = pyqtSignal(object)
-    failed = pyqtSignal(str)
-    status = pyqtSignal(str)
+    """后台线程：执行跨模态检索。"""
+    completed = pyqtSignal(object)  # 成功：发射 RetrievalResult
+    failed = pyqtSignal(str)        # 失败：发射错误堆栈
+    status = pyqtSignal(str)        # 进度更新
 
     def __init__(self, session: FusionDatasetSession, sample: QuerySample, sketch_path: Path, text: str, top_k: int) -> None:
         super().__init__()
@@ -83,7 +110,14 @@ class RetrievalThread(QThread):
             self.failed.emit(traceback.format_exc())
 
 
+# ============================================================
+# StableImageLabel — 固定尺寸提示的图像标签
+# ============================================================
+# 重写 sizeHint/minimumSizeHint 以维持稳定的布局，避免图像加载时界面抖动。
+
 class StableImageLabel(QLabel):
+    """固定首选尺寸的 QLabel，保证布局稳定不随内容变化。"""
+
     def __init__(self, preferred_size: QSize, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._preferred_size = preferred_size
@@ -98,11 +132,19 @@ class StableImageLabel(QLabel):
         )
 
 
+# ============================================================
+# ImageCard — 图片卡片组件
+# ============================================================
+# 展示一张图片，包含标题、图片和说明文字。
+# 支持自适应缩放（resizeEvent 时重新渲染 pixmap）。
+
 class ImageCard(QWidget):
+    """图片卡片：标题 + 自适应缩放图片 + 说明文字。"""
+
     def __init__(self, title: str, image_size: QSize, accent: bool = False, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._image_size = image_size
-        self._accent = accent
+        self._accent = accent  # 是否高亮（Top-1 结果使用强调边框）
         self._pixmap: Optional[QPixmap] = None
 
         layout = QVBoxLayout(self)
@@ -129,6 +171,7 @@ class ImageCard(QWidget):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
     def _render_pixmap(self) -> None:
+        """将原始 QPixmap 按当前 label 大小等比缩放后显示。"""
         if self._pixmap is None:
             return
         target_size = self.image_label.size()
@@ -136,12 +179,13 @@ class ImageCard(QWidget):
             return
         scaled = self._pixmap.scaled(
             target_size,
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
+            Qt.KeepAspectRatio,        # 保持宽高比
+            Qt.SmoothTransformation,   # 平滑缩放
         )
         self.image_label.setPixmap(scaled)
 
     def clear(self, title: Optional[str] = None) -> None:
+        """清空卡片内容。"""
         if title is not None:
             self.title_label.setText(title)
         self._pixmap = None
@@ -150,6 +194,7 @@ class ImageCard(QWidget):
         self.caption_label.setText("")
 
     def set_content(self, title: str, image_path: Optional[Path], caption: str = "") -> None:
+        """设置卡片内容：标题 + 图片 + 说明。"""
         self.title_label.setText(title)
         self.caption_label.setText(caption)
         if image_path is None or not image_path.exists():
@@ -169,26 +214,33 @@ class ImageCard(QWidget):
         self._render_pixmap()
 
     def resizeEvent(self, event) -> None:
+        """窗口大小改变时重新渲染 pixmap 以适配新尺寸。"""
         super().resizeEvent(event)
         self._render_pixmap()
 
 
+# ============================================================
+# MainWindow — 主窗口
+# ============================================================
+
 class MainWindow(QMainWindow):
+    """STFusionIR 桌面检索主窗口。"""
+
     def __init__(self, workspace: Optional[FusionWorkspace] = None) -> None:
         super().__init__()
         self.workspace = workspace or FusionWorkspace()
-        self.current_session: Optional[FusionDatasetSession] = None
+        self.current_session: Optional[FusionDatasetSession] = None  # 当前加载的数据集会话
         self._load_thread: Optional[DatasetLoaderThread] = None
         self._retrieval_thread: Optional[RetrievalThread] = None
 
         self.setWindowTitle("STFusionIR Retrieval Desktop")
         self.setMinimumSize(1320, 840)
 
-        self._build_ui()
-        self._configure_initial_geometry()
-        self._apply_styles()
-        self._populate_datasets()
-        self._start_loading_current_dataset()
+        self._build_ui()                       # 构建界面
+        self._configure_initial_geometry()     # 自适应屏幕尺寸
+        self._apply_styles()                   # 应用 QSS 样式
+        self._populate_datasets()              # 填充数据集下拉列表
+        self._start_loading_current_dataset()  # 启动默认数据集加载（blockSignals 会丢弃信号，必须显式调用）
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -492,6 +544,13 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:
+        """关闭窗口前停止所有后台线程，防止线程回调访问已销毁的 Qt 对象。"""
+        # 停止后台线程
+        for thread in (self._load_thread, self._retrieval_thread):
+            if thread is not None and thread.isRunning():
+                thread.quit()
+                thread.wait(3000)  # 最多等待 3 秒
+        # 清理焦点，避免关闭时的奇怪行为
         for widget in (self.text_edit, self.sample_filter, self.sample_list, self.sketch_list):
             widget.clearFocus()
         focused = QApplication.focusWidget()
@@ -500,6 +559,7 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _configure_initial_geometry(self) -> None:
+        """自适应屏幕尺寸：窗口占屏幕 90%，左右分栏约 24%/76%。"""
         default_width = 1560
         default_height = 960
         screen = QApplication.primaryScreen()
@@ -521,25 +581,34 @@ class MainWindow(QMainWindow):
         if available is None:
             return
 
+        # 窗口居中
         self.move(
             available.x() + max(0, (available.width() - target_width) // 2),
             available.y() + max(0, (available.height() - target_height) // 2),
         )
 
     def _set_status(self, message: str) -> None:
-        self.header_status.setText(message)
+        """更新状态栏文本（线程安全：通过 Qt 信号槽机制在主线程执行）。"""
+        try:
+            self.header_status.setText(message)
+        except RuntimeError:
+            pass  # C++ 对象已销毁（窗口关闭中），静默忽略
 
     def _set_controls_enabled(self, enabled: bool) -> None:
-        has_session = self.current_session is not None
-        self.dataset_combo.setEnabled(enabled)
-        self.sample_filter.setEnabled(enabled)
-        self.clear_filter_button.setEnabled(enabled)
-        self.random_button.setEnabled(enabled and self.sample_list.count() > 0)
-        self.sample_list.setEnabled(enabled)
-        self.sketch_list.setEnabled(enabled and has_session)
-        self.text_edit.setEnabled(enabled and has_session)
-        self.restore_prompt_button.setEnabled(enabled and has_session)
-        self.retrieve_button.setEnabled(enabled and has_session)
+        """启用/禁用所有交互控件。带 C++ 对象有效性检查。"""
+        try:
+            has_session = self.current_session is not None
+            self.dataset_combo.setEnabled(enabled)
+            self.sample_filter.setEnabled(enabled)
+            self.clear_filter_button.setEnabled(enabled)
+            self.random_button.setEnabled(enabled and self.sample_list.count() > 0)
+            self.sample_list.setEnabled(enabled)
+            self.sketch_list.setEnabled(enabled and has_session)
+            self.text_edit.setEnabled(enabled and has_session)
+            self.restore_prompt_button.setEnabled(enabled and has_session)
+            self.retrieve_button.setEnabled(enabled and has_session)
+        except RuntimeError:
+            pass  # 窗口关闭中，C++ 对象已销毁
 
     def _populate_datasets(self) -> None:
         self.dataset_combo.blockSignals(True)
@@ -567,9 +636,17 @@ class MainWindow(QMainWindow):
         self._clear_results()
 
     def _start_loading_current_dataset(self) -> None:
+        """启动当前选中数据集的加载（后台线程）。避免重复加载。"""
         dataset_key = self.dataset_combo.currentData()
         if not dataset_key:
             return
+
+        # 防止重复加载：如果已有线程在运行且加载的是同一数据集，则跳过
+        if self._load_thread is not None and self._load_thread.isRunning():
+            if getattr(self._load_thread, 'dataset_key', None) == dataset_key:
+                return
+            self._load_thread.quit()
+            self._load_thread.wait(2000)
 
         self.current_session = None
         self.dataset_info_label.setText("Loading dataset: {}".format(dataset_key))
@@ -584,7 +661,11 @@ class MainWindow(QMainWindow):
         self._load_thread.start()
 
     def _on_dataset_loaded(self, session: FusionDatasetSession) -> None:
-        expected_key = self.dataset_combo.currentData()
+        """数据集加载完成回调。验证是否为当前期望的数据集。"""
+        try:
+            expected_key = self.dataset_combo.currentData()
+        except RuntimeError:
+            return  # 窗口已关闭
         if session.definition.key != expected_key:
             return
 
@@ -726,6 +807,7 @@ class MainWindow(QMainWindow):
             self.text_edit.setPlainText(sample.text)
 
     def _start_retrieval(self) -> None:
+        """用户点击 "Retrieve Top-5" 按钮 → 启动后台检索线程。"""
         if self.current_session is None:
             QMessageBox.warning(self, "Dataset Not Ready", "Please wait until the dataset has finished loading.")
             return
@@ -759,6 +841,7 @@ class MainWindow(QMainWindow):
         self._retrieval_thread.start()
 
     def _on_retrieval_completed(self, result: RetrievalResult) -> None:
+        """检索完成：填充 Top-5 结果卡片，显示 GT 排名。"""
         for index, card in enumerate(self.result_cards):
             if index < len(result.hits):
                 hit = result.hits[index]
@@ -782,16 +865,25 @@ class MainWindow(QMainWindow):
         self._set_controls_enabled(True)
 
     def _on_worker_failed(self, traceback_text: str) -> None:
+        """后台线程失败时的统一错误处理。"""
         self._set_controls_enabled(True)
         self._set_status("Operation failed")
         QMessageBox.critical(self, "Error", traceback_text)
 
 
+# ============================================================
+# launch_app — 应用启动入口
+# ============================================================
+
 def launch_app() -> int:
+    """创建 QApplication 和 MainWindow，启动事件循环。
+    自动选择系统中可用的最佳中英文字体。
+    """
     app = QApplication.instance()
     owns_app = app is None
     if app is None:
         app = QApplication([])
+    # 优先选择中文字体，保证中文正常显示
     font_db = QFontDatabase()
     installed = set(font_db.families())
     for family in (

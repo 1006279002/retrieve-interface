@@ -1,3 +1,14 @@
+"""
+CLIP 模型加载与预处理工具
+==========================
+基于 OpenAI CLIP 的本地实现，支持 ViT 和 ResNet 系列模型。
+
+主要接口:
+  - available_models() → 列出可用的预训练模型名称
+  - load(name, device)  → 加载 CLIP 模型和对应的图像预处理 pipeline
+  - tokenize(texts)     → 将文本列表转换为 CLIP token
+"""
+
 import hashlib
 import os
 import urllib
@@ -21,6 +32,7 @@ except ImportError:
 __all__ = ["available_models", "load", "tokenize"]
 _tokenizer = _Tokenizer()
 
+# OpenAI 官方预训练模型 URL 映射表
 _MODELS = {
     "RN50": "https://openaipublic.azureedge.net/clip/models/afeb0e10f9e5a86da6080e35cf09123aca3b358a0c3e3b6c78a7b63bc04b6762/RN50.pt",
     "RN101": "https://openaipublic.azureedge.net/clip/models/8fa8567bab74a42d41c5915025a8e4538c3bdbe8804a470a72f30b0d94fab599/RN101.pt",
@@ -35,10 +47,11 @@ _MODELS = {
 
 
 def _download(url: str, root: str):
+    """从 OpenAI 服务器下载 CLIP 模型权重，带进度条和 SHA256 校验。"""
     os.makedirs(root, exist_ok=True)
     filename = os.path.basename(url)
 
-    expected_sha256 = url.split("/")[-2]
+    expected_sha256 = url.split("/")[-2]  # URL 中倒数第二段为 SHA256 哈希
     download_target = os.path.join(root, filename)
 
     if os.path.exists(download_target) and not os.path.isfile(download_target):
@@ -46,7 +59,7 @@ def _download(url: str, root: str):
 
     if os.path.isfile(download_target):
         if hashlib.sha256(open(download_target, "rb").read()).hexdigest() == expected_sha256:
-            return download_target
+            return download_target  # 已存在且校验通过，跳过下载
         else:
             warnings.warn(f"{download_target} exists, but the SHA256 checksum does not match; re-downloading the file")
 
@@ -67,10 +80,12 @@ def _download(url: str, root: str):
 
 
 def _convert_image_to_rgb(image):
+    """将图像转换为 RGB 模式。"""
     return image.convert("RGB")
 
 
 def _transform(n_px):
+    """CLIP 标准图像预处理 pipeline：Resize → CenterCrop → RGB → ToTensor → Normalize。"""
     return Compose([
         Resize(n_px, interpolation=BICUBIC),
         CenterCrop(n_px),
@@ -81,23 +96,23 @@ def _transform(n_px):
 
 
 def available_models() -> List[str]:
-    """Returns the names of available CLIP models"""
+    """返回所有可用 CLIP 模型名称列表。"""
     return list(_MODELS.keys())
 
 
 def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu", jit: bool = False, download_root: str = None):
-    """Load a CLIP model
+    """加载 CLIP 模型。
 
     Parameters
     ----------
     name : str
-        A model name listed by `clip.available_models()`, or the path to a model checkpoint containing the state_dict
-
+        模型名称（如 "ViT-B/32"）或本地 .pt 文件路径
     device : Union[str, torch.device]
-        The device to put the loaded model
-
+        目标设备
     jit : bool
-        Whether to load the optimized JIT model or more hackable non-JIT model (default).
+        是否加载 JIT 优化版本（默认 False，更灵活）
+    download_root : str
+        模型下载缓存目录
 
     download_root: str
         path to download the model files; by default, it uses "~/.cache/clip"

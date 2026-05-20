@@ -1,3 +1,14 @@
+"""
+CLIP 模型架构实现
+=================
+包含 OpenAI CLIP 的核心网络结构：
+  - Bottleneck        — ResNet 瓶颈残差块（带抗锯齿下采样）
+  - AttentionPool2d   — 基于 QKV 注意力的空间池化
+  - ModifiedResNet    — 改进的 ResNet 图像编码器
+  - VisionTransformer — ViT 图像编码器
+  - CLIP              — 顶层 CLIP 模型（视觉 + 文本编码器）
+"""
+
 from collections import OrderedDict
 from typing import Tuple, Union
 
@@ -8,6 +19,9 @@ from torch import nn
 
 
 class Bottleneck(nn.Module):
+    """ResNet 瓶颈残差块（1×1 → 3×3 → 1×1），带抗锯齿平均池化下采样。
+    与标准 torchvision Bottleneck 的区别：stride>1 时用 AvgPool2d 代替 stride=2 卷积。
+    """
     expansion = 4
 
     def __init__(self, inplanes, planes, stride=1):
@@ -56,6 +70,10 @@ class Bottleneck(nn.Module):
 
 
 class AttentionPool2d(nn.Module):
+    """基于多头自注意力的 2D 空间池化层。
+    将 H×W 特征图展平为序列，前置一个可学习的 [CLS] token，
+    通过单头/多头注意力聚合全局信息，输出 [CLS] 对应的特征向量。
+    """
     def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
         super().__init__()
         self.positional_embedding = nn.Parameter(torch.randn(spacial_dim ** 2 + 1, embed_dim) / embed_dim ** 0.5)
@@ -92,11 +110,11 @@ class AttentionPool2d(nn.Module):
 
 
 class ModifiedResNet(nn.Module):
-    """
-    A ResNet class that is similar to torchvision's but contains the following changes:
-    - There are now 3 "stem" convolutions as opposed to 1, with an average pool instead of a max pool.
-    - Performs anti-aliasing strided convolutions, where an avgpool is prepended to convolutions with stride > 1
-    - The final pooling layer is a QKV attention instead of an average pool
+    """改进的 ResNet 图像编码器（CLIP 专用）。
+    与标准 torchvision ResNet 的区别：
+      - 3 层 stem 卷积 + AvgPool（而非 1 层 + MaxPool）
+      - 抗锯齿下采样：stride>1 时用 AvgPool2d 替代 stride=2 卷积
+      - 最终池化层使用 QKV 注意力而非平均池化
     """
 
     def __init__(self, layers, output_dim, heads, input_resolution=224, width=64):
@@ -155,7 +173,7 @@ class ModifiedResNet(nn.Module):
 
 
 class LayerNorm(nn.LayerNorm):
-    """Subclass torch's LayerNorm to handle fp16."""
+    """子类化 LayerNorm，强制以 float32 精度计算以避免 fp16 数值不稳定。"""
 
     def forward(self, x: torch.Tensor):
         orig_type = x.dtype
@@ -164,11 +182,15 @@ class LayerNorm(nn.LayerNorm):
 
 
 class QuickGELU(nn.Module):
+    """快速 GELU 激活函数近似：x * sigmoid(1.702 * x)。"""
+
     def forward(self, x: torch.Tensor):
         return x * torch.sigmoid(1.702 * x)
 
 
 class ResidualAttentionBlock(nn.Module):
+    """标准 Transformer 残差注意力块：Self-Attention → MLP，均带 LayerNorm + 残差连接。"""
+
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
         super().__init__()
 
@@ -180,19 +202,22 @@ class ResidualAttentionBlock(nn.Module):
             ("c_proj", nn.Linear(d_model * 4, d_model))
         ]))
         self.ln_2 = LayerNorm(d_model)
-        self.attn_mask = attn_mask
+        self.attn_mask = attn_mask  # 因果注意力掩码（文本编码器使用）
 
     def attention(self, x: torch.Tensor):
+        """自注意力：Q=K=V=x，支持因果掩码。"""
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
     def forward(self, x: torch.Tensor):
-        x = x + self.attention(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.attention(self.ln_1(x))  # Pre-LN + Self-Attention + 残差
+        x = x + self.mlp(self.ln_2(x))         # Pre-LN + MLP + 残差
         return x
 
 
 class Transformer(nn.Module):
+    """Transformer 编码器：堆叠 N 层 ResidualAttentionBlock。"""
+
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
         super().__init__()
         self.width = width
@@ -204,52 +229,57 @@ class Transformer(nn.Module):
 
 
 class VisionTransformer(nn.Module):
+    """ViT 视觉编码器：Patch Embedding → [CLS] Token + 位置编码 → Transformer → 投影。"""
+
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int, input_channels: int = 3):
         super().__init__()
         self.input_resolution = input_resolution
         self.output_dim = output_dim
+        # Patch 嵌入：用 stride=patch_size 的 Conv2d 将图像切分为不重叠的 patches
         self.conv1 = nn.Conv2d(in_channels=input_channels, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
 
         scale = width ** -0.5
-        self.class_embedding = nn.Parameter(scale * torch.randn(width))
-        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
-        self.ln_pre = LayerNorm(width)
+        self.class_embedding = nn.Parameter(scale * torch.randn(width))           # 可学习的 [CLS] token
+        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))  # 位置编码
+        self.ln_pre = LayerNorm(width)      # Transformer 前 LayerNorm
 
         self.transformer = Transformer(width, layers, heads)
 
-        self.ln_post = LayerNorm(width)
-        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+        self.ln_post = LayerNorm(width)     # Transformer 后 LayerNorm
+        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))  # 输出投影矩阵
 
     def _forward_features(self, x: torch.Tensor):
+        """提取视觉特征：Patch Embedding → [CLS] + 位置编码 → Transformer。"""
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        # 前置 [CLS] token
+        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)
         x = x + self.positional_embedding.to(x.dtype)
         x = self.ln_pre(x)
 
-        x = x.permute(1, 0, 2)  # NLD -> LND
+        x = x.permute(1, 0, 2)  # NLD -> LND（PyTorch MHA 要求）
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
-
         x = self.ln_post(x)
         return x
 
     def forward(self, x: torch.Tensor, return_full_sequence: bool = False):
+        """前向传播。return_full_sequence=True 时同时返回所有 patch token。"""
         x = self._forward_features(x)
 
-        cls_token = x[:, 0, :]
+        cls_token = x[:, 0, :]  # 提取 [CLS] token
         if self.proj is not None:
-            cls_proj = cls_token @ self.proj
+            cls_proj = cls_token @ self.proj  # 投影到输出维度
         else:
             cls_proj = cls_token
 
         if return_full_sequence:
             return cls_proj, x
-
         return cls_proj
 
     def forward_with_patches(self, x: torch.Tensor):
+        """返回 [CLS] 投影、原始 [CLS]、patch tokens、完整序列。"""
         sequence = self._forward_features(x)
         cls_token = sequence[:, 0, :]
         patch_tokens = sequence[:, 1:, :]
@@ -261,6 +291,16 @@ class VisionTransformer(nn.Module):
 
 
 class CLIP(nn.Module):
+    """CLIP 顶层模型：视觉编码器 + 文本编码器 → 共享嵌入空间。
+
+    视觉编码器:  ViT (VisionTransformer) 或 ModifiedResNet
+    文本编码器:  Transformer（因果注意力）
+
+    核心方法:
+      - encode_image(image) → 图像特征向量
+      - encode_text(text)   → 文本特征向量（取 EOT token 的输出）
+      - forward(image, text) → 图像-文本余弦相似度 logits
+    """
     def __init__(self,
                  embed_dim: int,
                  # vision
@@ -279,7 +319,9 @@ class CLIP(nn.Module):
 
         self.context_length = context_length
 
+        # 根据 vision_layers 类型选择视觉编码器架构
         if isinstance(vision_layers, (tuple, list)):
+            # tuple → ModifiedResNet（各阶段残差块数量）
             vision_heads = vision_width * 32 // 64
             self.visual = ModifiedResNet(
                 layers=vision_layers,
@@ -289,6 +331,7 @@ class CLIP(nn.Module):
                 width=vision_width
             )
         else:
+            # int → VisionTransformer（层数）
             vision_heads = vision_width // 64
             self.visual = VisionTransformer(
                 input_resolution=image_resolution,
@@ -300,6 +343,7 @@ class CLIP(nn.Module):
                 input_channels=3
             )
 
+        # 文本 Transformer（带因果注意力掩码）
         self.transformer = Transformer(
             width=transformer_width,
             layers=transformer_layers,
@@ -308,16 +352,17 @@ class CLIP(nn.Module):
         )
 
         self.vocab_size = vocab_size
-        self.token_embedding = nn.Embedding(vocab_size, transformer_width)
-        self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))
-        self.ln_final = LayerNorm(transformer_width)
+        self.token_embedding = nn.Embedding(vocab_size, transformer_width)        # 词嵌入
+        self.positional_embedding = nn.Parameter(torch.empty(self.context_length, transformer_width))  # 可学习位置编码
+        self.ln_final = LayerNorm(transformer_width)                               # 最终 LayerNorm
 
-        self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))
-        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
+        self.text_projection = nn.Parameter(torch.empty(transformer_width, embed_dim))  # 文本 → 共享空间投影
+        self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))              # 可学习的温度系数（初始化为 log(1/0.07)）
 
         self.initialize_parameters()
 
     def initialize_parameters(self):
+        """初始化所有可学习参数。"""
         nn.init.normal_(self.token_embedding.weight, std=0.02)
         nn.init.normal_(self.positional_embedding, std=0.01)
 
@@ -347,21 +392,27 @@ class CLIP(nn.Module):
             nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
 
     def build_attention_mask(self):
-        # lazily create causal attention mask, with full attention between the vision tokens
-        # pytorch uses additive attention mask; fill with -inf
+        """构建因果注意力掩码（下三角矩阵）：每个 token 只能关注自身及之前的 token。
+        PyTorch 使用加法掩码：-inf 表示禁止关注，0 表示允许。
+        """
         mask = torch.empty(self.context_length, self.context_length)
         mask.fill_(float("-inf"))
-        mask.triu_(1)  # zero out the lower diagonal
+        mask.triu_(1)  # 上三角（不含对角线）设为 -inf
         return mask
 
     @property
     def dtype(self):
+        """模型的数据类型（从第一个卷积权重推断）。"""
         return self.visual.conv1.weight.dtype
 
     def encode_image(self, image):
+        """编码图像 → L2 归一化前的特征向量。"""
         return self.visual(image.type(self.dtype))
 
     def encode_text(self, text):
+        """编码文本（tokenized）→ L2 归一化前的特征向量。
+        取序列中 EOT（End of Text）token 位置的输出作为文本表示。
+        """
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
 
         x = x + self.positional_embedding.type(self.dtype)
@@ -370,21 +421,20 @@ class CLIP(nn.Module):
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
 
-        # x.shape = [batch_size, n_ctx, transformer.width]
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
+        # EOT token 是每个序列中编号最大的 token；取其输出并投影到共享空间
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
-
         return x
 
     def forward(self, image, text):
+        """完整的 CLIP 前向传播：计算图像-文本余弦相似度矩阵。"""
         image_features = self.encode_image(image)
         text_features = self.encode_text(text)
 
-        # normalized features
+        # L2 归一化
         image_features = image_features / image_features.norm(dim=1, keepdim=True)
         text_features = text_features / text_features.norm(dim=1, keepdim=True)
 
-        # cosine similarity as logits
+        # 缩放后的余弦相似度作为 logits
         logit_scale = self.logit_scale.exp()
         logits_per_image = logit_scale * image_features @ text_features.t()
         logits_per_text = logits_per_image.t()

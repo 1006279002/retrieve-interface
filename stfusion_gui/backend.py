@@ -1,3 +1,18 @@
+"""
+STFusionIR 后端模块
+==================
+负责模型加载、特征提取、图库索引缓存和跨模态检索的核心逻辑。
+不依赖任何 GUI 框架，可被命令行或 GUI 前端复用。
+
+核心类:
+  - DatasetDefinition: 数据集元信息（路径、模式等）
+  - QuerySample:      单条查询样本（图片 + 多张草图 + 文本描述）
+  - RetrievalHit:     检索结果中的单条命中
+  - RetrievalResult:  一次完整检索的结果
+  - FusionDatasetSession: 单个数据集的检索会话（管理模型、图库特征矩阵）
+  - FusionWorkspace:      多数据集工作区（管理多个 session）
+"""
+
 from __future__ import annotations
 
 import json
@@ -17,65 +32,85 @@ from torchvision.transforms import InterpolationMode
 from .inference import clip
 from .inference.cstbir_fusion_model import SketchyFusionModel
 
+# ---- 路径常量 ----
+WORKSPACE_ROOT = Path(__file__).resolve().parent.parent  # 项目根目录
+ASSET_ROOT = Path(os.environ.get("STFUSION_ASSET_ROOT", WORKSPACE_ROOT / "stfusion_assets")).expanduser().resolve()  # 模型/配置资源目录
+DEFAULT_CACHE_DIR = WORKSPACE_ROOT / ".stfusion_cache"  # 图库特征缓存目录
 
-WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
-ASSET_ROOT = Path(os.environ.get("STFUSION_ASSET_ROOT", WORKSPACE_ROOT / "stfusion_assets")).expanduser().resolve()
-DEFAULT_CACHE_DIR = WORKSPACE_ROOT / ".stfusion_cache"
-
+# ImageNet 标准归一化参数（用于草图预处理）
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
+# 状态回调类型：用于向 GUI 报告加载进度
+# 参数: (消息文本, 当前进度, 总数)
 StatusCallback = Optional[Callable[[str, Optional[int], Optional[int]], None]]
 
 
+# ============================================================
+# 数据模型
+# ============================================================
+
 @dataclass(frozen=True)
 class DatasetDefinition:
-    key: str
-    label: str
-    config_path: Path
-    checkpoint_path: Path
-    text_index_path: Path
-    image_root: Path
-    sketch_root: Path
-    mode: str
+    """数据集定义：包含路径、模式和元信息。frozen=True 保证不可变。"""
+    key: str                     # 数据集唯一标识（如 "sketchy", "chair", "shoe"）
+    label: str                   # 显示名称
+    config_path: Path            # YAML 配置文件路径
+    checkpoint_path: Path        # 融合模型权重 .pt 文件
+    text_index_path: Path        # 文本索引文件（每行: image_path\ttext_description）
+    image_root: Path             # 照片图库根目录
+    sketch_root: Path            # 草图根目录
+    mode: str                    # 数据集模式: "sketchy"（多类别）或 "paired"（配对草图-照片）
 
 
 @dataclass
 class QuerySample:
-    id: str
-    label: str
-    category: str
-    virtual_class: str
-    text: str
-    image_path: Path
-    sketch_paths: List[Path]
+    """单条查询样本：包含参考照片、候选草图列表和文本描述。"""
+    id: str                      # 样本唯一 ID
+    label: str                   # 列表显示标签
+    category: str                # 类别名（如 "airplane", "chair"）
+    virtual_class: str           # 虚拟类别（用于 prompt 模板数量推断）
+    text: str                    # 自然语言描述
+    image_path: Path             # 参考（ground-truth）照片路径
+    sketch_paths: List[Path]     # 该样本的所有候选草图路径
 
 
 @dataclass
 class RetrievalHit:
-    rank: int
-    score: float
-    image_path: Path
+    """检索结果中的单条命中记录。"""
+    rank: int                    # 排名（1-based）
+    score: float                 # 余弦相似度分数
+    image_path: Path             # 命中图片路径
 
 
 @dataclass
 class RetrievalResult:
-    dataset_key: str
-    sample: QuerySample
-    sketch_path: Path
-    query_text: str
-    hits: List[RetrievalHit]
-    ground_truth_rank: Optional[int]
+    """一次完整检索的结果。"""
+    dataset_key: str             # 数据集标识
+    sample: QuerySample          # 查询样本
+    sketch_path: Path            # 实际使用的草图路径
+    query_text: str              # 实际使用的文本查询
+    hits: List[RetrievalHit]     # Top-K 命中列表
+    ground_truth_rank: Optional[int]  # GT 图片的排名（用于评估，None 表示不在图库中）
 
 
 @dataclass
 class AssetCheck:
-    name: str
-    path: Optional[Path]
-    exists: bool
-    required: bool
-    note: str = ""
+    """资源文件检查结果。"""
+    name: str                    # 资源名称
+    path: Optional[Path]         # 文件路径
+    exists: bool                 # 是否存在
+    required: bool               # 是否必需
+    note: str = ""               # 额外说明
 
+
+# ============================================================
+# 数据集注册表
+# ============================================================
+# 三个预定义数据集，各自使用独立的配置文件、checkpoint 和文本索引。
+# mode 决定样本构建逻辑：
+#   "sketchy" — 多类别手绘草图数据集（125 类），样本按类别组织
+#   "paired"  — ChairV2 / ShoeV2 配对数据集，草图与照片一一对应
 
 DATASETS: Dict[str, DatasetDefinition] = {
     "sketchy": DatasetDefinition(
@@ -111,21 +146,31 @@ DATASETS: Dict[str, DatasetDefinition] = {
 }
 
 
+# ============================================================
+# 工具函数
+# ============================================================
+
 def list_dataset_definitions() -> List[DatasetDefinition]:
+    """返回所有已注册数据集的列表。"""
     return [DATASETS[key] for key in ("sketchy", "chair", "shoe")]
 
 
 def _emit_status(callback: StatusCallback, message: str, current: Optional[int] = None, total: Optional[int] = None) -> None:
+    """安全地调用状态回调（如果提供）。"""
     if callback is not None:
         callback(message, current, total)
 
 
 def _load_yaml(path: Path) -> Dict[str, object]:
+    """加载 YAML 配置文件。"""
     with path.open("r", encoding="utf-8") as handle:
         return yaml.safe_load(handle)
 
 
 def _resolve_path(raw_path: str | Path, base_paths: Sequence[Path]) -> Path:
+    """路径解析：支持绝对路径，相对路径依次在 base_paths 中查找。
+    若都找不到，默认使用第一个 base_path 拼接。
+    """
     candidate = Path(raw_path).expanduser()
     if candidate.is_absolute():
         return candidate
@@ -137,6 +182,9 @@ def _resolve_path(raw_path: str | Path, base_paths: Sequence[Path]) -> Path:
 
 
 def _select_device(preferred: Optional[str] = None) -> str:
+    """智能选择计算设备：CUDA > MPS (macOS) > CPU。
+    支持环境变量 STFUSION_DEVICE 覆盖。
+    """
     env_override = os.environ.get("STFUSION_DEVICE")
     if env_override:
         preferred = env_override
@@ -158,11 +206,12 @@ def _select_device(preferred: Optional[str] = None) -> str:
 
 
 def _default_sketch_transform(image_size: int) -> transforms.Compose:
+    """草图预处理 pipeline：Resize → CenterCrop → 灰度转3通道 → ToTensor → ImageNet 归一化。"""
     return transforms.Compose(
         [
             transforms.Resize(image_size, interpolation=InterpolationMode.BICUBIC),
             transforms.CenterCrop(image_size),
-            transforms.Grayscale(num_output_channels=3),
+            transforms.Grayscale(num_output_channels=3),  # 草图转 3 通道以适配 ImageNet 预训练模型
             transforms.ToTensor(),
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ]
@@ -170,16 +219,19 @@ def _default_sketch_transform(image_size: int) -> transforms.Compose:
 
 
 def _load_image(path: Path, preprocess) -> torch.Tensor:
+    """加载照片并应用 CLIP 预处理。"""
     with Image.open(path) as img:
         return preprocess(img.convert("RGB"))
 
 
 def _load_sketch(path: Path, transform) -> torch.Tensor:
+    """加载草图并应用草图专用变换。"""
     with Image.open(path) as img:
         return transform(img.convert("RGB"))
 
 
 def _read_text_index(path: Path) -> List[tuple[str, str]]:
+    """解析文本索引文件（TSV 格式）：image_path \\t text_description。"""
     if not path.exists():
         raise FileNotFoundError("Text index not found: {}".format(path))
 
@@ -195,6 +247,9 @@ def _read_text_index(path: Path) -> List[tuple[str, str]]:
 
 
 def _trailing_number_key(path: Path) -> tuple[str, int]:
+    """从文件名提取尾部数字用作排序键。如 "sketch_3.png" → ("sketch_", 3)。
+    无数字时返回 (stem, -1)，排在最后。
+    """
     match = re.search(r"(\d+)$", path.stem)
     if match:
         return path.stem[: match.start(1)], int(match.group(1))
@@ -202,15 +257,21 @@ def _trailing_number_key(path: Path) -> tuple[str, int]:
 
 
 def _sorted_sketches(paths: Iterable[Path]) -> List[Path]:
+    """按文件名尾部数字排序草图路径。"""
     return sorted(paths, key=lambda item: _trailing_number_key(item))
 
 
 def _sample_label(index: int, primary: str, secondary: str, text: str) -> str:
+    """生成样本在列表中的显示标签：序号 | 类别 | 文件名 | 文本摘要。"""
     snippet = " ".join(text.split())[:28]
     return "{:04d} | {} | {} | {}".format(index + 1, primary, secondary, snippet)
 
 
 def _build_sketchy_samples(definition: DatasetDefinition) -> List[QuerySample]:
+    """为 Sketchy 模式构建样本列表。
+    文本索引格式: transform_dir/category/filename.jpg \\t description
+    草图为同一 transform_dir/category 下 filename-*.png。
+    """
     samples: List[QuerySample] = []
     for index, (relative_image, raw_text) in enumerate(_read_text_index(definition.text_index_path)):
         rel_path = Path(relative_image)
@@ -219,6 +280,7 @@ def _build_sketchy_samples(definition: DatasetDefinition) -> List[QuerySample]:
         transform_dir, category, filename = rel_path.parts[0], rel_path.parts[1], rel_path.parts[-1]
         image_path = (definition.image_root / rel_path).resolve()
         stem = Path(filename).stem
+        # 同一类别目录下查找所有同名前缀的草图
         sketch_glob = definition.sketch_root / transform_dir / category / "{}-*.png".format(stem)
         sketch_paths = _sorted_sketches(sketch_glob.parent.glob(sketch_glob.name))
         text = raw_text.replace("<sketch>", category.replace("_", " ")).strip()
@@ -237,6 +299,10 @@ def _build_sketchy_samples(definition: DatasetDefinition) -> List[QuerySample]:
 
 
 def _build_paired_samples(definition: DatasetDefinition) -> List[QuerySample]:
+    """为 Paired 模式（ChairV2/ShoeV2）构建样本列表。
+    文本索引格式: filename \\t description
+    草图匹配: stem_*.png 前缀匹配。
+    """
     dataset_name = definition.label.lower()
     samples: List[QuerySample] = []
     for index, (filename, text) in enumerate(_read_text_index(definition.text_index_path)):
@@ -258,6 +324,7 @@ def _build_paired_samples(definition: DatasetDefinition) -> List[QuerySample]:
 
 
 def _build_samples(definition: DatasetDefinition) -> List[QuerySample]:
+    """根据数据集模式分派样本构建。"""
     if definition.mode == "sketchy":
         return _build_sketchy_samples(definition)
     if definition.mode == "paired":
@@ -266,6 +333,9 @@ def _build_samples(definition: DatasetDefinition) -> List[QuerySample]:
 
 
 def _resolve_required_files(definition: DatasetDefinition) -> List[AssetCheck]:
+    """检查数据集所需的所有文件是否存在：config、checkpoint、文本索引、图片/草图根目录、
+    以及 sketch backbone 预训练权重和 CLIP 模型权重。
+    """
     config = _load_yaml(definition.config_path) if definition.config_path.exists() else {}
     model_cfg = config.get("model", {}) if isinstance(config, dict) else {}
 
@@ -277,6 +347,7 @@ def _resolve_required_files(definition: DatasetDefinition) -> List[AssetCheck]:
         AssetCheck("{} sketch root".format(definition.label), definition.sketch_root, definition.sketch_root.exists(), True),
     ]
 
+    # 检查 sketch 编码器预训练权重（如 QuickDraw pretrained ResNet-50）
     sketch_pretrained = model_cfg.get("sketch_pretrained")
     if isinstance(sketch_pretrained, str):
         sketch_pretrained_path = _resolve_path(sketch_pretrained, [ASSET_ROOT, WORKSPACE_ROOT])
@@ -289,6 +360,7 @@ def _resolve_required_files(definition: DatasetDefinition) -> List[AssetCheck]:
             )
         )
 
+    # 检查 CLIP 模型权重（支持本地文件或自动下载）
     clip_model_path = model_cfg.get("clip_model_path")
     if isinstance(clip_model_path, str) and clip_model_path.strip():
         clip_path = _resolve_path(clip_model_path, [ASSET_ROOT, WORKSPACE_ROOT])
@@ -315,6 +387,7 @@ def _resolve_required_files(definition: DatasetDefinition) -> List[AssetCheck]:
 
 
 def workspace_asset_report() -> Dict[str, object]:
+    """生成工作区完整资源报告（用于 audit.py 诊断）。"""
     datasets = {}
     missing_required = []
     for definition in list_dataset_definitions():
@@ -363,27 +436,40 @@ def workspace_asset_report() -> Dict[str, object]:
     }
 
 
+# ============================================================
+# FusionDatasetSession — 单个数据集的检索会话
+# ============================================================
+# 管理一个数据集的完整生命周期：
+#   1. 加载 YAML 配置 + 构建样本列表
+#   2. 构建 SketchyFusionModel（CLIP + Sketch Encoder + Fusion Prompt）
+#   3. 预计算图库中所有图像的特征矩阵（带缓存）
+#   4. 执行跨模态检索（Sketch + Text → 图像排名）
+
 class FusionDatasetSession:
+    """单个数据集的检索会话。惰性初始化：首次 ensure_ready() 时才加载模型和图库。"""
+
     def __init__(self, definition: DatasetDefinition, cache_dir: Optional[Path] = None) -> None:
         self.definition = definition
         self.cache_dir = cache_dir or DEFAULT_CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        self.config = _load_yaml(self.definition.config_path)
-        self.samples = _build_samples(self.definition)
-        self.gamma = float(self.config.get("retrieval", {}).get("gamma", 0.6))
+        self.config = _load_yaml(self.definition.config_path)      # YAML 配置字典
+        self.samples = _build_samples(self.definition)              # 所有查询样本
+        self.gamma = float(self.config.get("retrieval", {}).get("gamma", 0.6))  # 融合权重：gamma * fusion_query + (1-gamma) * avg_baseline
 
+        # 延迟初始化的成员
         self.device_name: Optional[str] = None
         self.device: Optional[torch.device] = None
-        self.preprocess = None
-        self.sketch_transform = None
+        self.preprocess = None           # CLIP 图像预处理
+        self.sketch_transform = None     # 草图预处理
         self.model: Optional[SketchyFusionModel] = None
-        self.gallery_paths: List[Path] = []
-        self.gallery_matrix: Optional[torch.Tensor] = None
-        self._gallery_index: Dict[Path, int] = {}
+        self.gallery_paths: List[Path] = []            # 图库图像路径列表
+        self.gallery_matrix: Optional[torch.Tensor] = None  # 图库特征矩阵 [N, D]
+        self._gallery_index: Dict[Path, int] = {}       # 路径 → 矩阵行索引映射
         self._ready = False
 
     def _resolve_num_template_prompts(self) -> int:
+        """推断模板 prompt 数量：优先用配置值，否则用数据集中唯一 virtual_class 数量。"""
         model_cfg = self.config.get("model", {})
         explicit = model_cfg.get("num_template_prompts")
         if explicit is not None:
@@ -391,9 +477,16 @@ class FusionDatasetSession:
         return max(1, len({sample.virtual_class for sample in self.samples}))
 
     def _cache_path(self) -> Path:
+        """图库特征缓存的磁盘路径。"""
         return self.cache_dir / "{}_gallery.pt".format(self.definition.key)
 
     def _build_model(self, status_callback: StatusCallback = None) -> None:
+        """构建融合检索模型：
+        1. 加载 CLIP（ViT-B/32 或自定义路径）
+        2. 加载 Sketch Encoder（ResNet-50 + QuickDraw 预训练权重）
+        3. 构建 FusionPromptModule（可学习的类感知模板 prompt）
+        4. 加载训练好的 checkpoint，冻结所有特征提取器
+        """
         training_cfg = self.config.get("training", {})
         preferred_device = training_cfg.get("device")
         self.device_name = _select_device(str(preferred_device) if preferred_device else None)
@@ -442,11 +535,16 @@ class FusionDatasetSession:
         self.sketch_transform = _default_sketch_transform(int(self.config.get("data", {}).get("image_size", 224)))
 
     def _load_gallery_cache(self) -> bool:
+        """尝试从磁盘加载图库特征缓存。
+        缓存有效性验证：检查 dataset key + config/checkpoint/text_index 的路径和修改时间。
+        任何不匹配都会导致缓存失效，触发重新计算。
+        """
         cache_path = self._cache_path()
         if not cache_path.exists() or self.device is None:
             return False
 
         payload = torch.load(str(cache_path), map_location="cpu")
+        # 验证缓存与当前数据集配置是否一致
         expected = {
             "dataset_key": self.definition.key,
             "config_path": str(self.definition.config_path.resolve()),
@@ -471,6 +569,7 @@ class FusionDatasetSession:
         return True
 
     def _save_gallery_cache(self) -> None:
+        """将图库特征矩阵保存到磁盘缓存，附带数据集元信息用于后续验证。"""
         if self.gallery_matrix is None:
             return
 
@@ -488,18 +587,24 @@ class FusionDatasetSession:
         torch.save(payload, str(self._cache_path()))
 
     def _compute_gallery_matrix(self, status_callback: StatusCallback = None) -> None:
+        """使用 CLIP 图像编码器预计算图库中所有图像的特征矩阵。
+        支持批量编码；遇到 cuDNN 错误时自动降级（减小 batch size 或禁用 cuDNN）。
+        结果自动缓存到磁盘。
+        """
         if self.model is None or self.preprocess is None or self.device is None:
             raise RuntimeError("Model session is not initialized.")
 
+        # 收集所有唯一图像路径（去重）
         unique_images = sorted({sample.image_path.resolve() for sample in self.samples if sample.image_path.exists()})
         if not unique_images:
             raise ValueError("No gallery images found for dataset '{}'.".format(self.definition.key))
 
         batch_size = int(self.config.get("feature_cache", {}).get("image_batch_size", 32))
         current_batch_size = max(1, batch_size)
-        cudnn_enabled = torch.backends.cudnn.enabled
+        cudnn_enabled = torch.backends.cudnn.enabled  # 保存原始 cuDNN 状态
 
         def encode_once(batch_value: int) -> torch.Tensor:
+            """按指定 batch size 编码全部图像，返回特征矩阵 [N, D]。"""
             chunks: List[torch.Tensor] = []
             total = len(unique_images)
             with torch.no_grad():
@@ -521,21 +626,23 @@ class FusionDatasetSession:
                     return
                 except RuntimeError as exc:
                     message = str(exc)
+                    # 仅在 CUDA cuDNN 相关错误时才尝试降级策略
                     cudnn_error = "Unable to find a valid cuDNN algorithm" in message or "cuDNN" in message
                     if self.device.type != "cuda" or not cudnn_error:
                         raise
                     torch.cuda.empty_cache()
                     if current_batch_size > 1:
-                        current_batch_size = max(1, current_batch_size // 2)
+                        current_batch_size = max(1, current_batch_size // 2)  # 减半 batch size 重试
                         continue
                     if torch.backends.cudnn.enabled:
-                        torch.backends.cudnn.enabled = False
+                        torch.backends.cudnn.enabled = False  # 禁用 cuDNN 重试
                         continue
                     raise
         finally:
-            torch.backends.cudnn.enabled = cudnn_enabled
+            torch.backends.cudnn.enabled = cudnn_enabled  # 恢复原始 cuDNN 状态
 
     def ensure_ready(self, status_callback: StatusCallback = None) -> None:
+        """确保会话就绪：加载模型 → 加载/构建图库特征矩阵。幂等操作。"""
         if self._ready:
             return
         self._build_model(status_callback=status_callback)
@@ -552,6 +659,16 @@ class FusionDatasetSession:
         text: str,
         top_k: int = 5,
     ) -> RetrievalResult:
+        """执行跨模态检索：Sketch + Text → Top-K 图像排名。
+
+        检索流程：
+          1. 用 CLIP 编码文本 → text_feat
+          2. 用 Sketch Encoder 编码草图 → sketch_feat
+          3. 通过 FusionPromptModule 融合两个模态 → fusion_query
+          4. 用 gamma 插值：final_query = gamma * fusion_query + (1-gamma) * avg(sketch, text)
+          5. final_query 与预计算的图库矩阵做余弦相似度，取 Top-K
+          6. 同时计算 ground-truth 图片的排名（用于评估）
+        """
         if not self._ready:
             self.ensure_ready()
         if self.model is None or self.sketch_transform is None or self.device is None or self.gallery_matrix is None:
@@ -562,19 +679,24 @@ class FusionDatasetSession:
         top_k = max(1, min(int(top_k), len(self.gallery_paths)))
 
         with torch.no_grad():
+            # 1. 文本编码
             tokens = clip.tokenize([text], truncate=True).to(self.device)
             text_feat = self.model.encode_texts(tokens).squeeze(0)
 
+            # 2. 草图编码
             sketch_tensor = _load_sketch(sketch_path, self.sketch_transform).unsqueeze(0).to(self.device)
             sketch_feat = self.model.encode_sketches(sketch_tensor).squeeze(0)
 
+            # 3. 融合查询
             query_fusion = self.model.build_fusion_query(
                 text_feat=text_feat.unsqueeze(0),
                 sketch_feat=sketch_feat.unsqueeze(0),
             ).squeeze(0)
+            # 4. gamma 加权插值：在纯融合信号和简单平均之间平衡
             base_signal = F.normalize((sketch_feat + text_feat) * 0.5, dim=0)
             query = F.normalize(self.gamma * query_fusion + (1.0 - self.gamma) * base_signal, dim=0)
 
+            # 5. 余弦相似度排序
             scores = torch.matmul(query.unsqueeze(0), self.gallery_matrix.t()).squeeze(0)
             sorted_indices = torch.argsort(scores, descending=True)
 
@@ -588,6 +710,7 @@ class FusionDatasetSession:
                 )
             )
 
+        # 6. 查找 ground-truth 图片排名
         ground_truth_rank = None
         target_index = self._gallery_index.get(sample.image_path.resolve())
         if target_index is not None:
@@ -603,15 +726,24 @@ class FusionDatasetSession:
         )
 
 
+# ============================================================
+# FusionWorkspace — 多数据集工作区
+# ============================================================
+# 管理多个 FusionDatasetSession，按需创建和缓存。
+
 class FusionWorkspace:
+    """多数据集工作区管理器。维护 dataset_key → FusionDatasetSession 的映射。"""
+
     def __init__(self, cache_dir: Optional[Path] = None) -> None:
         self.cache_dir = cache_dir or DEFAULT_CACHE_DIR
         self._sessions: Dict[str, FusionDatasetSession] = {}
 
     def list_datasets(self) -> List[DatasetDefinition]:
+        """列出所有可用数据集的元信息。"""
         return list_dataset_definitions()
 
     def get_session(self, dataset_key: str) -> FusionDatasetSession:
+        """获取指定数据集的会话（惰性创建 + 缓存）。"""
         if dataset_key not in DATASETS:
             raise KeyError("Unknown dataset: {}".format(dataset_key))
         if dataset_key not in self._sessions:
@@ -619,9 +751,11 @@ class FusionWorkspace:
         return self._sessions[dataset_key]
 
     def asset_report(self) -> Dict[str, object]:
+        """生成工作区资源状态报告。"""
         return workspace_asset_report()
 
     def export_dataset_summary(self) -> str:
+        """导出所有数据集的摘要信息（JSON lines 格式）。"""
         summary = []
         for definition in self.list_datasets():
             session = self.get_session(definition.key)
