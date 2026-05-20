@@ -10,3 +10,5 @@ checkpoints/
 model/
 
 datasets.zip
+
+.vscode/
